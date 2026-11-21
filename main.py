@@ -3,324 +3,260 @@ import re
 import json
 import uuid
 import subprocess
-import urllib.request
-from flask import Flask, request, send_file, jsonify
+from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
+import yt_dlp
 
 app = Flask(__name__)
 CORS(app)
 
-BASE_DIR = "/tmp/clip_jobs"
-os.makedirs(BASE_DIR, exist_ok=True)
+OUTPUT_DIR = "/tmp/clips"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 
-def parse_timestamp(ts_str):
-    parts = [int(float(x)) for x in str(ts_str).strip().split(":")]
-    if len(parts) == 3:
-        return parts[0] * 3600 + parts[1] * 60 + parts[2]
-    if len(parts) == 2:
-        return parts[0] * 60 + parts[1]
-    return int(parts[0])
+def to_seconds(t_str):
+    parts = str(t_str).strip().split(":")
+    try:
+        nums = [float(x) for x in parts]
+    except ValueError:
+        return 0.0
+    if len(nums) == 3:
+        return nums[0] * 3600 + nums[1] * 60 + nums[2]
+    if len(nums) == 2:
+        return nums[0] * 60 + nums[1]
+    if len(nums) == 1:
+        return nums[0]
+    return 0.0
 
 
-def format_timestamp(seconds):
-    seconds = max(0, int(seconds))
-    h = seconds // 3600
-    m = (seconds % 3600) // 60
-    s = seconds % 60
+def to_hms(sec):
+    sec = max(0, int(round(sec)))
+    h = sec // 3600
+    m = (sec % 3600) // 60
+    s = sec % 60
     return f"{h:02d}:{m:02d}:{s:02d}"
+
+
+def extract_video_info(url):
+    ydl_opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        "skip_download": True,
+        "extractor_args": {"youtube": {"player_client": ["android", "web", "tv"]}},
+    }
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=False)
+        return {
+            "title": info.get("title") or "YouTube Video",
+            "duration": float(info.get("duration") or 120),
+            "description": (info.get("description") or "")[:2000],
+            "chapters": info.get("chapters") or [],
+        }
 
 
 def run_yt_dlp_clip(url, start_str, end_str, raw_path, final_path, aspect="9:16"):
     dl_cmd = [
         "yt-dlp",
         "--no-playlist",
+        "--no-warnings",
+        "--extractor-args", "youtube:player_client=android,web,tv",
         "--download-sections", f"*{start_str}-{end_str}",
-        "-f", "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+        "-f", "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/bestvideo*+bestaudio*/best",
         "--merge-output-format", "mp4",
+        "--force-keyframes-at-cuts",
         "-o", raw_path,
-        url
+        url,
     ]
-    subprocess.run(dl_cmd, check=True, timeout=120)
+    subprocess.run(dl_cmd, check=True, timeout=180)
+
+    if not os.path.exists(raw_path):
+        for fname in os.listdir(OUTPUT_DIR):
+            base = os.path.splitext(os.path.basename(raw_path))[0]
+            if fname.startswith(base) and fname.endswith(".mp4"):
+                raw_path = os.path.join(OUTPUT_DIR, fname)
+                break
 
     if aspect == "9:16":
         crop_cmd = [
             "ffmpeg", "-y", "-i", raw_path,
             "-vf", "crop=ih*9/16:ih,scale=720:1280",
+            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "26",
+            "-c:a", "aac", "-b:a", "128k",
+            final_path,
+        ]
+        subprocess.run(crop_cmd, check=True, timeout=180)
+    else:
+        encode_cmd = [
+            "ffmpeg", "-y", "-i", raw_path,
             "-c:v", "libx264", "-preset", "ultrafast", "-crf", "25",
-            "-c:a", "aac",
-            final_path
+            "-c:a", "aac", "-b:a", "128k",
+            final_path,
         ]
-        subprocess.run(crop_cmd, check=True, timeout=120)
-    else:
-        os.replace(raw_path, final_path)
+        subprocess.run(encode_cmd, check=True, timeout=180)
 
 
-def fetch_video_meta_and_subs(url, job_dir):
-    title = ""
-    duration = 600
-    sub_text = ""
+def fallback_moments(duration, max_clips, clip_len):
+    safe_dur = max(float(duration or 90), float(clip_len) + 5)
+    usable_end = max(float(clip_len), safe_dur - 5)
+    if usable_end <= clip_len:
+        return [{"start": 0, "end": min(clip_len, safe_dur), "reason": "Best Highlight Segment"}]
 
-    try:
-        info_cmd = ["yt-dlp", "--no-playlist", "--print", "%(title)s\n%(duration)s", url]
-        res = subprocess.run(info_cmd, capture_output=True, text=True, timeout=35)
-        lines = [ln.strip() for ln in (res.stdout or "").splitlines() if ln.strip()]
-        if len(lines) >= 1:
-            title = lines[0]
-        if len(lines) >= 2:
-            try:
-                duration = int(float(lines[1]))
-            except Exception:
-                duration = 600
-    except Exception:
-        pass
-
-    try:
-        sub_cmd = [
-            "yt-dlp",
-            "--no-playlist",
-            "--skip-download",
-            "--write-auto-subs",
-            "--sub-lang", "en,hi",
-            "--sub-format", "vtt",
-            "-o", os.path.join(job_dir, "sub_%(id)s.%(ext)s"),
-            url
-        ]
-        subprocess.run(sub_cmd, check=False, timeout=45)
-        vtt_files = [f for f in os.listdir(job_dir) if f.endswith(".vtt")]
-        chunks = []
-        for vf in vtt_files:
-            with open(os.path.join(job_dir, vf), "r", encoding="utf-8", errors="ignore") as f:
-                raw = re.sub(r"<[^>]+>", " ", f.read())
-                raw = re.sub(r"WEBVTT.*?\n\n", "", raw, flags=re.S)
-                chunks.append(raw[:6000])
-        sub_text = "\n".join(chunks)[:8000]
-    except Exception:
-        pass
-
-    return title, duration, sub_text
-
-
-def ask_gemini_for_moments(api_key, title, duration, sub_text, max_clips, clip_len):
-    if not api_key:
-        return None
-    prompt = (
-        f"You are a viral YouTube Shorts editor. Video title: '{title}', total duration: {duration}s.\n"
-        f"Transcript/captions snippet:\n{sub_text or 'No captions available'}\n\n"
-        f"Pick {max_clips} viral highlight start times in seconds (between 0 and {max(10, duration - clip_len)}) "
-        f"and a short reason for each. Reply strictly as a JSON list of objects with keys "
-        f"'start_sec' (integer) and 'reason' (short string). No markdown."
-    )
-    payload = json.dumps({"contents": [{"parts": [{"text": prompt}]}]}).encode("utf-8")
-
-    auth_variants = [
-        {"headers": {"Content-Type": "application/json", "x-goog-api-key": api_key}, "suffix": ""},
-        {"headers": {"Content-Type": "application/json"}, "suffix": f"?key={api_key}"},
-        {"headers": {"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}, "suffix": ""},
-    ]
-
-    for model in ("gemini-2.5-flash", "gemini-2.0-flash"):
-        base_url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-        for variant in auth_variants:
-            endpoint = f"{base_url}{variant['suffix']}"
-            req = urllib.request.Request(
-                endpoint,
-                data=payload,
-                headers=variant["headers"],
-                method="POST"
-            )
-            try:
-                with urllib.request.urlopen(req, timeout=25) as resp:
-                    body = json.loads(resp.read().decode("utf-8"))
-                    text = body["candidates"][0]["content"]["parts"][0]["text"]
-                    match = re.search(r"\[.*\]", text, re.S)
-                    if not match:
-                        continue
-                    parsed = json.loads(match.group(0))
-                    out = []
-                    for item in parsed[:max_clips]:
-                        st = max(0, min(max(0, duration - clip_len), int(item.get("start_sec", 0))))
-                        out.append({
-                            "start_sec": st,
-                            "end_sec": st + clip_len,
-                            "reason": f"[Gemini] {str(item.get('reason', 'Viral Moment'))[:60]}"
-                        })
-                    if out:
-                        return out
-            except Exception as e:
-                app.logger.warning(f"Gemini attempt failed ({model}): {e}")
-                continue
-    return None
-
-
-def ask_claude_for_moments(api_key, title, duration, sub_text, max_clips, clip_len):
-    if not api_key:
-        return None
-    prompt = (
-        f"You are a viral YouTube Shorts editor. Video title: '{title}', total duration: {duration}s.\n"
-        f"Transcript/captions snippet:\n{sub_text or 'No captions available'}\n\n"
-        f"Pick {max_clips} viral highlight start times in seconds (between 0 and {max(10, duration - clip_len)}) "
-        f"and a short reason for each. Reply strictly as a JSON list of objects with keys "
-        f"'start_sec' (integer) and 'reason' (short string). No markdown."
-    )
-    endpoint = "https://api.anthropic.com/v1/messages"
-    payload = json.dumps({
-        "model": "claude-3-5-sonnet-latest",
-        "max_tokens": 600,
-        "messages": [{"role": "user", "content": prompt}]
-    }).encode("utf-8")
-    req = urllib.request.Request(
-        endpoint,
-        data=payload,
-        headers={
-            "Content-Type": "application/json",
-            "x-api-key": api_key,
-            "anthropic-version": "2023-06-01"
-        },
-        method="POST"
-    )
-    with urllib.request.urlopen(req, timeout=25) as resp:
-        body = json.loads(resp.read().decode("utf-8"))
-        text = body["content"][0]["text"]
-        match = re.search(r"\[.*\]", text, re.S)
-        if not match:
-            return None
-        parsed = json.loads(match.group(0))
-        out = []
-        for item in parsed[:max_clips]:
-            st = max(0, min(max(0, duration - clip_len), int(item.get("start_sec", 0))))
-            out.append({
-                "start_sec": st,
-                "end_sec": st + clip_len,
-                "reason": f"[Claude] {str(item.get('reason', 'Viral Moment'))[:60]}"
-            })
-        return out or None
-
-
-def fallback_smart_moments(duration, sub_text, max_clips, clip_len):
+    step = max(float(clip_len), (usable_end - clip_len) / max(1, max_clips - 1))
     moments = []
-    if sub_text:
-        keywords = [
-            "oh my god", "no way", "crazy", "insane", "final",
-            "fight", "police", "chase", "shoot", "let's go", "khatarnak", "gazab"
-        ]
-        pattern = re.compile(r"(\d{2}:\d{2}:\d{2})\.\d{3}\s+-->\s+\d{2}:\d{2}:\d{2}\.\d{3}\s*\n(.*?)(?=\n\n|\Z)", re.S)
-        hits = []
-        for m in pattern.finditer(sub_text):
-            sec = parse_timestamp(m.group(1))
-            clean_txt = re.sub(r"\s+", " ", m.group(2)).strip().lower()
-            score = sum(1 for kw in keywords if kw in clean_txt)
-            if score > 0:
-                hits.append((sec, score, clean_txt[:50]))
-        for sec, score, snip in sorted(hits, key=lambda x: -x[1]):
-            if all(abs(sec - ex["start_sec"]) >= clip_len + 15 for ex in moments):
-                st = max(0, min(max(0, duration - clip_len), sec - 4))
-                moments.append({
-                    "start_sec": st,
-                    "end_sec": st + clip_len,
-                    "reason": f"[Multi-AI Smart] {snip or 'High Energy'}"
-                })
-            if len(moments) >= max_clips:
-                break
-
-    if not moments:
-        if duration > clip_len * 2:
-            step = max(clip_len + 10, duration // (max_clips + 1))
-            for i in range(1, max_clips + 1):
-                st = min(max(0, duration - clip_len), i * step)
-                moments.append({
-                    "start_sec": st,
-                    "end_sec": st + clip_len,
-                    "reason": f"[Multi-AI Highlight #{i}]"
-                })
-        else:
-            moments.append({
-                "start_sec": 0,
-                "end_sec": min(duration, clip_len),
-                "reason": "[Multi-AI Highlight #1]"
-            })
-    return moments[:max_clips]
-
-
-def find_best_moments(url, job_dir, ai_engine="multi", gemini_key="", claude_key="", max_clips=3, clip_len=25):
-    title, duration, sub_text = fetch_video_meta_and_subs(url, job_dir)
-    g_key = (gemini_key or os.environ.get("GEMINI_API_KEY") or "").strip()
-    c_key = (claude_key or os.environ.get("ANTHROPIC_API_KEY") or "").strip()
-
-    moments = None
-    if ai_engine == "gemini":
-        try:
-            moments = ask_gemini_for_moments(g_key, title, duration, sub_text, max_clips, clip_len)
-        except Exception:
-            moments = None
-    elif ai_engine == "claude":
-        try:
-            moments = ask_claude_for_moments(c_key, title, duration, sub_text, max_clips, clip_len)
-        except Exception:
-            moments = None
-    else:
-        for fn, key in [(ask_gemini_for_moments, g_key), (ask_claude_for_moments, c_key)]:
-            if key:
-                try:
-                    moments = fn(key, title, duration, sub_text, max_clips, clip_len)
-                    if moments:
-                        break
-                except Exception:
-                    continue
-
-    if not moments:
-        moments = fallback_smart_moments(duration, sub_text, max_clips, clip_len)
-
-    moments.sort(key=lambda x: x["start_sec"])
-    for idx, item in enumerate(moments, start=1):
-        item["id"] = f"clip_{idx}"
-        item["start"] = format_timestamp(item["start_sec"])
-        item["end"] = format_timestamp(item["end_sec"])
+    for i in range(max_clips):
+        st = min(usable_end - clip_len, max(0.0, i * step))
+        en = min(safe_dur, st + clip_len)
+        moments.append({
+            "start": round(st, 1),
+            "end": round(en, 1),
+            "reason": f"High-energy highlight #{i + 1}",
+        })
     return moments
 
 
-@app.route("/", methods=["GET"])
+def pick_ai_moments(info, max_clips, clip_len, ai_engine="multi", gemini_key="", claude_key=""):
+    duration = info.get("duration", 120)
+    chapters = info.get("chapters") or []
+    if chapters and ai_engine in ("multi", "smart"):
+        picked = []
+        for ch in chapters[:max_clips]:
+            st = float(ch.get("start_time") or 0)
+            en = min(float(duration), st + float(clip_len))
+            if en > st:
+                picked.append({
+                    "start": st,
+                    "end": en,
+                    "reason": ch.get("title") or "Chapter Highlight",
+                })
+        if picked:
+            return picked
+
+    g_key = (gemini_key or os.environ.get("GEMINI_API_KEY") or "").strip()
+    c_key = (claude_key or os.environ.get("ANTHROPIC_API_KEY") or "").strip()
+
+    prompt = (
+        f"Video title: {info.get('title')}\n"
+        f"Duration (seconds): {duration}\n"
+        f"Description: {info.get('description')}\n"
+        f"Pick {max_clips} engaging viral clips of {clip_len} seconds each. "
+        f"Return ONLY JSON array of objects with keys start (seconds number), end (seconds number), reason (short string)."
+    )
+
+    if ai_engine in ("gemini", "multi") and g_key and g_key.startswith("AIza"):
+        try:
+            import urllib.request
+            models = ["gemini-2.5-flash", "gemini-2.0-flash"]
+            for m in models:
+                api_url = f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent?key={g_key}"
+                payload = json.dumps({
+                    "contents": [{"parts": [{"text": prompt}]}]
+                }).encode("utf-8")
+                req = urllib.request.Request(api_url, data=payload, headers={"Content-Type": "application/json"}, method="POST")
+                with urllib.request.urlopen(req, timeout=20) as resp:
+                    raw = json.loads(resp.read().decode("utf-8"))
+                    txt = raw["candidates"][0]["content"]["parts"][0]["text"]
+                    match = re.search(r"\[[\s\S]*\]", txt)
+                    if match:
+                        arr = json.loads(match.group(0))
+                        valid = []
+                        for item in arr[:max_clips]:
+                            st = max(0.0, float(item.get("start", 0)))
+                            en = min(float(duration), max(st + 5.0, float(item.get("end", st + clip_len))))
+                            if en > st:
+                                valid.append({
+                                    "start": st,
+                                    "end": en,
+                                    "reason": str(item.get("reason") or "Gemini Highlight")[:90],
+                                })
+                        if valid:
+                            return valid
+        except Exception:
+            pass
+
+    if ai_engine in ("claude", "multi") and c_key:
+        try:
+            import urllib.request
+            payload = json.dumps({
+                "model": "claude-3-5-haiku-latest",
+                "max_tokens": 500,
+                "messages": [{"role": "user", "content": prompt}],
+            }).encode("utf-8")
+            req = urllib.request.Request(
+                "https://api.anthropic.com/v1/messages",
+                data=payload,
+                headers={
+                    "Content-Type": "application/json",
+                    "x-api-key": c_key,
+                    "anthropic-version": "2023-06-01",
+                },
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                raw = json.loads(resp.read().decode("utf-8"))
+                txt = "".join(b.get("text", "") for b in raw.get("content", []))
+                match = re.search(r"\[[\s\S]*\]", txt)
+                if match:
+                    arr = json.loads(match.group(0))
+                    valid = []
+                    for item in arr[:max_clips]:
+                        st = max(0.0, float(item.get("start", 0)))
+                        en = min(float(duration), max(st + 5.0, float(item.get("end", st + clip_len))))
+                        if en > st:
+                            valid.append({
+                                "start": st,
+                                "end": en,
+                                "reason": str(item.get("reason") or "Claude Highlight")[:90],
+                            })
+                    if valid:
+                        return valid
+        except Exception:
+            pass
+
+    return fallback_moments(duration, max_clips, clip_len)
+
+
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok", "service": "multi-ai-yt-clipper"}), 200
+    return jsonify({"status": "ok", "service": "clipcutter-api"}), 200
 
 
 @app.route("/cut", methods=["POST"])
-def manual_cut():
+def cut_video():
     data = request.get_json(silent=True) or {}
     url = (data.get("url") or "").strip()
-    start_raw = (data.get("start") or "").strip()
-    end_raw = (data.get("end") or "").strip()
+    start_str = (data.get("start") or "00:00:00").strip()
+    end_str = (data.get("end") or "00:00:15").strip()
     aspect = (data.get("aspect") or "9:16").strip()
 
-    if not url or not start_raw or not end_raw:
-        return jsonify({"error": "url, start, and end are required"}), 400
+    if not url:
+        return jsonify({"error": "YouTube URL required"}), 400
 
-    start_sec = parse_timestamp(start_raw)
-    end_sec = parse_timestamp(end_raw)
+    start_sec = to_seconds(start_str)
+    end_sec = to_seconds(end_str)
     if end_sec <= start_sec:
-        return jsonify({"error": "end time must be greater than start time"}), 400
-
-    start_str = format_timestamp(start_sec)
-    end_str = format_timestamp(end_sec)
+        return jsonify({"error": "End time must be greater than start time"}), 400
 
     job_id = str(uuid.uuid4())[:8]
-    job_dir = os.path.join(BASE_DIR, job_id)
-    os.makedirs(job_dir, exist_ok=True)
-
-    raw_path = os.path.join(job_dir, f"raw_{job_id}.mp4")
-    final_path = os.path.join(job_dir, f"clip_{job_id}.mp4")
+    raw_path = os.path.join(OUTPUT_DIR, f"raw_{job_id}.mp4")
+    final_name = f"cut_{job_id}.mp4"
+    final_path = os.path.join(OUTPUT_DIR, final_name)
 
     try:
-        run_yt_dlp_clip(url, start_str, end_str, raw_path, final_path, aspect=aspect)
-        return send_file(
-            final_path,
-            mimetype="video/mp4",
-            as_attachment=True,
-            download_name=f"clip_{start_str.replace(':', '-')}_to_{end_str.replace(':', '-')}.mp4"
-        )
+        run_yt_dlp_clip(url, to_hms(start_sec), to_hms(end_sec), raw_path, final_path, aspect=aspect)
+        if not os.path.exists(final_path):
+            return jsonify({"error": "Output clip not generated"}), 500
+        return send_from_directory(OUTPUT_DIR, final_name, as_attachment=True, download_name=final_name)
+    except subprocess.TimeoutExpired:
+        return jsonify({"error": "Processing timeout"}), 504
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+    finally:
+        if os.path.exists(raw_path):
+            try:
+                os.remove(raw_path)
+            except OSError:
+                pass
 
 
 @app.route("/auto-cut", methods=["POST"])
@@ -328,65 +264,75 @@ def auto_cut():
     data = request.get_json(silent=True) or {}
     url = (data.get("url") or "").strip()
     aspect = (data.get("aspect") or "9:16").strip()
-    ai_engine = (data.get("ai_engine") or "multi").strip().lower()
+    ai_engine = (data.get("ai_engine") or "multi").strip()
     gemini_key = (data.get("gemini_api_key") or "").strip()
     claude_key = (data.get("claude_api_key") or "").strip()
-    max_clips = min(max(int(data.get("max_clips", 3)), 1), 5)
-    clip_len = min(max(int(data.get("clip_len", 25)), 10), 60)
+    max_clips = max(1, min(5, int(data.get("max_clips") or 3)))
+    clip_len = max(10, min(60, int(data.get("clip_len") or 25)))
 
     if not url:
-        return jsonify({"error": "YouTube URL is required"}), 400
+        return jsonify({"error": "YouTube URL required"}), 400
 
-    job_id = str(uuid.uuid4())[:8]
-    job_dir = os.path.join(BASE_DIR, job_id)
-    os.makedirs(job_dir, exist_ok=True)
+    try:
+        info = extract_video_info(url)
+        moments = pick_ai_moments(
+            info,
+            max_clips=max_clips,
+            clip_len=clip_len,
+            ai_engine=ai_engine,
+            gemini_key=gemini_key,
+            claude_key=claude_key,
+        )
 
-    moments = find_best_moments(
-        url=url,
-        job_dir=job_dir,
-        ai_engine=ai_engine,
-        gemini_key=gemini_key,
-        claude_key=claude_key,
-        max_clips=max_clips,
-        clip_len=clip_len
-    )
-    results = []
+        results = []
+        for idx, m in enumerate(moments, start=1):
+            st_hms = to_hms(m["start"])
+            en_hms = to_hms(m["end"])
+            job_id = f"{uuid.uuid4().hex[:6]}_{idx}"
+            raw_path = os.path.join(OUTPUT_DIR, f"auto_raw_{job_id}.mp4")
+            out_name = f"auto_clip_{job_id}.mp4"
+            out_path = os.path.join(OUTPUT_DIR, out_name)
 
-    for m in moments:
-        clip_name = f"{job_id}_{m['id']}.mp4"
-        raw_path = os.path.join(job_dir, f"raw_{clip_name}")
-        final_path = os.path.join(job_dir, clip_name)
-
-        try:
-            run_yt_dlp_clip(url, m["start"], m["end"], raw_path, final_path, aspect=aspect)
-            if os.path.exists(final_path):
+            try:
+                run_yt_dlp_clip(url, st_hms, en_hms, raw_path, out_path, aspect=aspect)
+                if os.path.exists(out_path):
+                    results.append({
+                        "start": st_hms,
+                        "end": en_hms,
+                        "reason": m.get("reason") or "Best Highlight",
+                        "download_url": f"/download/{out_name}",
+                    })
+                else:
+                    results.append({
+                        "start": st_hms,
+                        "end": en_hms,
+                        "error": "Clip file missing",
+                    })
+            except Exception as clip_err:
                 results.append({
-                    "id": m["id"],
-                    "start": m["start"],
-                    "end": m["end"],
-                    "reason": m["reason"],
-                    "download_url": f"/download/{job_id}/{clip_name}"
+                    "start": st_hms,
+                    "end": en_hms,
+                    "error": str(clip_err),
                 })
-        except Exception as e:
-            results.append({
-                "id": m["id"],
-                "start": m["start"],
-                "end": m["end"],
-                "reason": m["reason"],
-                "error": str(e)
-            })
+            finally:
+                if os.path.exists(raw_path):
+                    try:
+                        os.remove(raw_path)
+                    except OSError:
+                        pass
 
-    return jsonify({"job_id": job_id, "ai_engine": ai_engine, "clips": results}), 200
+        return jsonify({"title": info.get("title"), "clips": results}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
-@app.route("/download/<job_id>/<filename>", methods=["GET"])
-def download_clip(job_id, filename):
-    safe_job = os.path.basename(job_id)
-    safe_file = os.path.basename(filename)
-    file_path = os.path.join(BASE_DIR, safe_job, safe_file)
-    if not os.path.exists(file_path):
+@app.route("/download/<filename>", methods=["GET"])
+def download_file(filename):
+    safe_name = os.path.basename(filename)
+    full_path = os.path.join(OUTPUT_DIR, safe_name)
+    if not os.path.exists(full_path):
         return jsonify({"error": "File not found"}), 404
-    return send_file(file_path, mimetype="video/mp4", as_attachment=True, download_name=safe_file)
+    return send_from_directory(OUTPUT_DIR, safe_name, as_attachment=True, download_name=safe_name)
 
 
 if __name__ == "__main__":
