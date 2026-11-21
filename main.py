@@ -1,7 +1,8 @@
-import os
+  import os
 import re
 import json
 import uuid
+import tempfile
 import subprocess
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
@@ -10,7 +11,7 @@ import yt_dlp
 app = Flask(__name__)
 CORS(app)
 
-OUTPUT_DIR = "/tmp/clips"
+OUTPUT_DIR = os.path.join(tempfile.gettempdir(), "clips")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 
@@ -78,22 +79,21 @@ def run_yt_dlp_clip(url, start_str, end_str, raw_path, final_path, aspect="9:16"
                 break
 
     if aspect == "9:16":
-        crop_cmd = [
+        cmd = [
             "ffmpeg", "-y", "-i", raw_path,
             "-vf", "crop=ih*9/16:ih,scale=720:1280",
             "-c:v", "libx264", "-preset", "ultrafast", "-crf", "26",
             "-c:a", "aac", "-b:a", "128k",
             final_path,
         ]
-        subprocess.run(crop_cmd, check=True, timeout=180)
     else:
-        encode_cmd = [
+        cmd = [
             "ffmpeg", "-y", "-i", raw_path,
             "-c:v", "libx264", "-preset", "ultrafast", "-crf", "25",
             "-c:a", "aac", "-b:a", "128k",
             final_path,
         ]
-        subprocess.run(encode_cmd, check=True, timeout=180)
+    subprocess.run(cmd, check=True, timeout=180)
 
 
 def fallback_moments(duration, max_clips, clip_len):
@@ -101,18 +101,15 @@ def fallback_moments(duration, max_clips, clip_len):
     usable_end = max(float(clip_len), safe_dur - 5)
     if usable_end <= clip_len:
         return [{"start": 0, "end": min(clip_len, safe_dur), "reason": "Best Highlight Segment"}]
-
     step = max(float(clip_len), (usable_end - clip_len) / max(1, max_clips - 1))
-    moments = []
-    for i in range(max_clips):
-        st = min(usable_end - clip_len, max(0.0, i * step))
-        en = min(safe_dur, st + clip_len)
-        moments.append({
-            "start": round(st, 1),
-            "end": round(en, 1),
+    return [
+        {
+            "start": round(min(usable_end - clip_len, max(0.0, i * step)), 1),
+            "end": round(min(safe_dur, min(usable_end - clip_len, max(0.0, i * step)) + clip_len), 1),
             "reason": f"High-energy highlight #{i + 1}",
-        })
-    return moments
+        }
+        for i in range(max_clips)
+    ]
 
 
 def pick_ai_moments(info, max_clips, clip_len, ai_engine="multi", gemini_key="", claude_key=""):
@@ -124,17 +121,12 @@ def pick_ai_moments(info, max_clips, clip_len, ai_engine="multi", gemini_key="",
             st = float(ch.get("start_time") or 0)
             en = min(float(duration), st + float(clip_len))
             if en > st:
-                picked.append({
-                    "start": st,
-                    "end": en,
-                    "reason": ch.get("title") or "Chapter Highlight",
-                })
+                picked.append({"start": st, "end": en, "reason": ch.get("title") or "Chapter Highlight"})
         if picked:
             return picked
 
     g_key = (gemini_key or os.environ.get("GEMINI_API_KEY") or "").strip()
     c_key = (claude_key or os.environ.get("ANTHROPIC_API_KEY") or "").strip()
-
     prompt = (
         f"Video title: {info.get('title')}\n"
         f"Duration (seconds): {duration}\n"
@@ -146,12 +138,9 @@ def pick_ai_moments(info, max_clips, clip_len, ai_engine="multi", gemini_key="",
     if ai_engine in ("gemini", "multi") and g_key and g_key.startswith("AIza"):
         try:
             import urllib.request
-            models = ["gemini-2.5-flash", "gemini-2.0-flash"]
-            for m in models:
+            for m in ["gemini-2.5-flash", "gemini-2.0-flash"]:
                 api_url = f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent?key={g_key}"
-                payload = json.dumps({
-                    "contents": [{"parts": [{"text": prompt}]}]
-                }).encode("utf-8")
+                payload = json.dumps({"contents": [{"parts": [{"text": prompt}]}]}).encode("utf-8")
                 req = urllib.request.Request(api_url, data=payload, headers={"Content-Type": "application/json"}, method="POST")
                 with urllib.request.urlopen(req, timeout=20) as resp:
                     raw = json.loads(resp.read().decode("utf-8"))
@@ -164,11 +153,7 @@ def pick_ai_moments(info, max_clips, clip_len, ai_engine="multi", gemini_key="",
                             st = max(0.0, float(item.get("start", 0)))
                             en = min(float(duration), max(st + 5.0, float(item.get("end", st + clip_len))))
                             if en > st:
-                                valid.append({
-                                    "start": st,
-                                    "end": en,
-                                    "reason": str(item.get("reason") or "Gemini Highlight")[:90],
-                                })
+                                valid.append({"start": st, "end": en, "reason": str(item.get("reason") or "Gemini Highlight")[:90]})
                         if valid:
                             return valid
         except Exception:
@@ -203,11 +188,7 @@ def pick_ai_moments(info, max_clips, clip_len, ai_engine="multi", gemini_key="",
                         st = max(0.0, float(item.get("start", 0)))
                         en = min(float(duration), max(st + 5.0, float(item.get("end", st + clip_len))))
                         if en > st:
-                            valid.append({
-                                "start": st,
-                                "end": en,
-                                "reason": str(item.get("reason") or "Claude Highlight")[:90],
-                            })
+                            valid.append({"start": st, "end": en, "reason": str(item.get("reason") or "Claude Highlight")[:90]})
                     if valid:
                         return valid
         except Exception:
@@ -228,10 +209,8 @@ def cut_video():
     start_str = (data.get("start") or "00:00:00").strip()
     end_str = (data.get("end") or "00:00:15").strip()
     aspect = (data.get("aspect") or "9:16").strip()
-
     if not url:
         return jsonify({"error": "YouTube URL required"}), 400
-
     start_sec = to_seconds(start_str)
     end_sec = to_seconds(end_str)
     if end_sec <= start_sec:
@@ -241,7 +220,6 @@ def cut_video():
     raw_path = os.path.join(OUTPUT_DIR, f"raw_{job_id}.mp4")
     final_name = f"cut_{job_id}.mp4"
     final_path = os.path.join(OUTPUT_DIR, final_name)
-
     try:
         run_yt_dlp_clip(url, to_hms(start_sec), to_hms(end_sec), raw_path, final_path, aspect=aspect)
         if not os.path.exists(final_path):
@@ -269,21 +247,12 @@ def auto_cut():
     claude_key = (data.get("claude_api_key") or "").strip()
     max_clips = max(1, min(5, int(data.get("max_clips") or 3)))
     clip_len = max(10, min(60, int(data.get("clip_len") or 25)))
-
     if not url:
         return jsonify({"error": "YouTube URL required"}), 400
 
     try:
         info = extract_video_info(url)
-        moments = pick_ai_moments(
-            info,
-            max_clips=max_clips,
-            clip_len=clip_len,
-            ai_engine=ai_engine,
-            gemini_key=gemini_key,
-            claude_key=claude_key,
-        )
-
+        moments = pick_ai_moments(info, max_clips=max_clips, clip_len=clip_len, ai_engine=ai_engine, gemini_key=gemini_key, claude_key=claude_key)
         results = []
         for idx, m in enumerate(moments, start=1):
             st_hms = to_hms(m["start"])
@@ -292,35 +261,20 @@ def auto_cut():
             raw_path = os.path.join(OUTPUT_DIR, f"auto_raw_{job_id}.mp4")
             out_name = f"auto_clip_{job_id}.mp4"
             out_path = os.path.join(OUTPUT_DIR, out_name)
-
             try:
                 run_yt_dlp_clip(url, st_hms, en_hms, raw_path, out_path, aspect=aspect)
                 if os.path.exists(out_path):
-                    results.append({
-                        "start": st_hms,
-                        "end": en_hms,
-                        "reason": m.get("reason") or "Best Highlight",
-                        "download_url": f"/download/{out_name}",
-                    })
+                    results.append({"start": st_hms, "end": en_hms, "reason": m.get("reason") or "Best Highlight", "download_url": f"/download/{out_name}"})
                 else:
-                    results.append({
-                        "start": st_hms,
-                        "end": en_hms,
-                        "error": "Clip file missing",
-                    })
+                    results.append({"start": st_hms, "end": en_hms, "error": "Clip file missing"})
             except Exception as clip_err:
-                results.append({
-                    "start": st_hms,
-                    "end": en_hms,
-                    "error": str(clip_err),
-                })
+                results.append({"start": st_hms, "end": en_hms, "error": str(clip_err)})
             finally:
                 if os.path.exists(raw_path):
                     try:
                         os.remove(raw_path)
                     except OSError:
                         pass
-
         return jsonify({"title": info.get("title"), "clips": results}), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
