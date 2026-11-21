@@ -5,6 +5,7 @@ ENV PYTHONUNBUFFERED=1
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
+    nodejs \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
@@ -12,10 +13,8 @@ WORKDIR /app
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir --upgrade -r requirements.txt
+    pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-EXPOSE 5000
-
-CMD ["gunicorn", "--bind", "0.0.0.0:5000", "--workers", "2", "--timeout", "240", "main:app"]
+CMD gunicorn --bind 0.0.0.0:${PORT:-5000} --workers 1 --threads 2 --worker-tmp-dir /dev/shm --timeout 300 main:app
