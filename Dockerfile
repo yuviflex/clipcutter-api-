@@ -1,20 +1,17 @@
-FROM python:3.11-slim
+FROM python:3.12-slim
 
-ENV PYTHONDONTWRITEBYTECODE=1
-ENV PYTHONUNBUFFERED=1
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ffmpeg \
-    nodejs \
-    ca-certificates \
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ffmpeg nodejs ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -U -r requirements.txt
 
-COPY . .
+COPY main.py .
 
-CMD gunicorn --bind 0.0.0.0:${PORT:-5000} --workers 1 --threads 2 --worker-tmp-dir /dev/shm --timeout 300 main:app
+ENV PORT=5000
+EXPOSE 5000
+
+CMD gunicorn -b 0.0.0.0:${PORT} --workers 1 --threads 4 --timeout 300 main:app
