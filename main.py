@@ -18,6 +18,28 @@ os.makedirs(OUT, exist_ok=True)
 os.makedirs(TMP, exist_ok=True)
 
 
+def setup_cookies():
+    # 1) Render Secret File  2) COOKIES_FILE env  3) ~/clipcutter/cookies.txt  4) COOKIES_TXT env
+    target = os.path.join(BASE, "cookies_rw.txt")
+    for p in (
+        os.environ.get("COOKIES_FILE"),
+        "/etc/secrets/cookies.txt",
+        os.path.join(BASE, "cookies.txt"),
+    ):
+        if p and os.path.exists(p):
+            shutil.copy(p, target)
+            return target
+    text = os.environ.get("COOKIES_TXT")
+    if text:
+        with open(target, "w") as f:
+            f.write(text)
+        return target
+    return None
+
+
+COOKIES = setup_cookies()
+
+
 @app.after_request
 def private_network_header(resp):
     resp.headers["Access-Control-Allow-Private-Network"] = "true"
@@ -38,6 +60,8 @@ def fmt(sec):
 
 
 def run(cmd):
+    if cmd[0] == "yt-dlp" and COOKIES:
+        cmd = [cmd[0], "--cookies", COOKIES] + cmd[1:]
     p = subprocess.run(cmd, capture_output=True, text=True)
     if p.returncode != 0:
         lines = [l for l in (p.stderr or p.stdout).strip().splitlines() if l.strip()]
@@ -76,6 +100,11 @@ def cut_clip(url, start_sec, end_sec, aspect):
         return out_name, out_path
     finally:
         shutil.rmtree(work, ignore_errors=True)
+
+
+@app.route("/")
+def home():
+    return jsonify({"name": "ClipCutter API", "cookies": bool(COOKIES)})
 
 
 @app.route("/health")
