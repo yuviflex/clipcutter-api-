@@ -1,9 +1,12 @@
+cat <<'EOF' > "$HOME/clipcutter/main.py"
 import argparse
 import json
 import os
+import random
 import re
 import subprocess
 import tempfile
+import time
 import urllib.request
 from flask import Flask, Response, jsonify, request, send_file
 from flask_cors import CORS
@@ -95,16 +98,16 @@ def ask_gemini_moments(meta: dict, count: int, clip_len: int, exclude: list, see
         f"Duration (sec): {meta.get('duration', 600)}\n"
         f"Chapters: {json.dumps(meta.get('chapters', [])[:15])}\n"
         f"Description snippet: {meta.get('description', '')}\n"
-        f"Exclude ranges: {json.dumps(exclude[-30:])}\n"
+        f"Exclude ranges: {json.dumps(exclude[-40:])}\n"
         f"Seed: {seed}\n\n"
-        f"Pick {count} distinct, high-retention highlight segments of ~{clip_len} seconds each "
-        f"within 0 to {meta.get('duration', 600)} seconds. Do NOT repeat any excluded range.\n"
+        f"Pick {count} completely new, distinct highlight segments of ~{clip_len} seconds each "
+        f"within 0 to {meta.get('duration', 600)} seconds. Never reuse or overlap any excluded range.\n"
         f'Return ONLY valid JSON array like: [{{"start":"00:01:10","end":"00:01:35"}}]'
     )
 
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 0.9},
+        "generationConfig": {"temperature": 1.1},
     }
 
     url = (
@@ -143,42 +146,67 @@ def ask_gemini_moments(meta: dict, count: int, clip_len: int, exclude: list, see
     return out
 
 
+def is_overlapping(st: int, en: int, chosen: list, excluded_spans: list) -> bool:
+    for c in chosen:
+        cst, cen = to_sec(c["start"]), to_sec(c["end"])
+        if st < cen + 5 and en + 5 > cst:
+            return True
+    for est, een in excluded_spans:
+        if st < een + 3 and en + 3 > est:
+            return True
+    return False
+
+
 def build_distinct_moments(meta: dict, gemini_list: list, count: int, clip_len: int, exclude: list, seed: int) -> list:
-    duration = max(clip_len + 10, int(meta.get("duration") or 600))
-    excluded_set = set(str(x).strip() for x in (exclude or []))
+    duration = max(clip_len + 15, int(meta.get("duration") or 600))
+    max_start = max(1, duration - clip_len)
+    excluded_spans = []
+    for item in (exclude or []):
+        s = str(item).strip()
+        if "-" in s:
+            left, right = s.split("-", 1)
+            excluded_spans.append((to_sec(left), to_sec(right)))
+
+    rng = random.Random(seed)
     chosen = []
 
     pool = list(gemini_list or [])
-    for ch in meta.get("chapters") or []:
-        st = max(0, min(duration - clip_len, int(ch.get("start_sec") or 0) + (seed % 11)))
-        pool.append({"start": fmt_sec(st), "end": fmt_sec(min(duration, st + clip_len))})
+    chapters = list(meta.get("chapters") or [])
+    if chapters:
+        rot = rng.randrange(len(chapters))
+        chapters = chapters[rot:] + chapters[:rot]
+        for ch in chapters:
+            jitter = rng.randint(5, 45)
+            st = max(0, min(max_start, int(ch.get("start_sec") or 0) + jitter))
+            pool.append({"start": fmt_sec(st), "end": fmt_sec(min(duration, st + clip_len))})
 
     for m in pool:
         if len(chosen) >= count:
             break
-        st = max(0, min(duration - clip_len, to_sec(m.get("start", 0))))
+        st = max(0, min(max_start, to_sec(m.get("start", 0))))
         en = min(duration, st + clip_len)
-        key = f"{fmt_sec(st)}-{fmt_sec(en)}"
-        overlap = any(st < to_sec(c["end"]) + 4 and en + 4 > to_sec(c["start"]) for c in chosen)
-        if key not in excluded_set and not overlap:
+        if not is_overlapping(st, en, chosen, excluded_spans):
             chosen.append({"start": fmt_sec(st), "end": fmt_sec(en)})
-            excluded_set.add(key)
 
-    guard = 0
-    while len(chosen) < count and guard < 150:
-        guard += 1
-        step = 15 + ((seed + guard * 19 + len(chosen) * 29) % 53)
-        st = (seed + guard * step) % max(1, duration - clip_len)
+    attempts = 0
+    while len(chosen) < count and attempts < 250:
+        attempts += 1
+        st = rng.randint(0, max_start)
         en = min(duration, st + clip_len)
-        key = f"{fmt_sec(st)}-{fmt_sec(en)}"
-        overlap = any(st < to_sec(c["end"]) + 4 and en + 4 > to_sec(c["start"]) for c in chosen)
-        if key not in excluded_set and not overlap:
+        if not is_overlapping(st, en, chosen, excluded_spans):
             chosen.append({"start": fmt_sec(st), "end": fmt_sec(en)})
-            excluded_set.add(key)
+
+    # Relax buffer if video is short and most ranges are excluded
+    fallback_tries = 0
+    while len(chosen) < count and fallback_tries < 100:
+        fallback_tries += 1
+        st = rng.randint(0, max_start)
+        en = min(duration, st + clip_len)
+        if not any(st < to_sec(c["end"]) and en > to_sec(c["start"]) for c in chosen):
+            chosen.append({"start": fmt_sec(st), "end": fmt_sec(en)})
 
     while len(chosen) < count:
-        idx = len(chosen)
-        st = (seed + idx * (clip_len + 17)) % max(1, duration - clip_len)
+        st = (rng.randint(0, max_start) + len(chosen) * (clip_len + 7)) % max(1, max_start + 1)
         en = min(duration, st + clip_len)
         chosen.append({"start": fmt_sec(st), "end": fmt_sec(en)})
 
@@ -339,12 +367,13 @@ def analyze_moments():
     count = max(1, min(10, int(data.get("max_clips") or 3)))
     clip_len = max(5, min(180, int(data.get("clip_len") or 25)))
     exclude = data.get("exclude") or []
-    seed = int(data.get("seed") or data.get("ts") or 42)
+    raw_seed = data.get("seed") if data.get("seed") is not None else data.get("ts")
+    seed = int(raw_seed) if raw_seed is not None else int(time.time() * 1000) ^ random.randint(1, 1_000_000)
 
     meta = fetch_ytdlp_meta(url)
     gemini_list = []
     try:
-        gemini_list = ask_gemini_moments(meta, count + 2, clip_len, exclude, seed)
+        gemini_list = ask_gemini_moments(meta, count + 3, clip_len, exclude, seed)
     except Exception:
         gemini_list = []
 
@@ -353,6 +382,7 @@ def analyze_moments():
         "title": meta.get("title", ""),
         "duration": meta.get("duration", 600),
         "analyzer": "gemini+ytdlp" if gemini_list else "ytdlp",
+        "seed": seed,
         "moments": moments,
     })
 
@@ -456,3 +486,5 @@ if __name__ == "__main__":
     else:
         port = int(os.environ.get("PORT") or 5000)
         app.run(host="127.0.0.1", port=port)
+EOF
+python -m py_compile "$HOME/clipcutter/main.py"
