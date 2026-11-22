@@ -1,3 +1,4 @@
+import argparse
 import json
 import os
 import re
@@ -239,6 +240,20 @@ def cut_with_ffmpeg(input_file: str, start: str, end: str, aspect: str, cam_side
         raise RuntimeError(res.stderr[-400:])
 
 
+def run_cli_batch(input_file: str, ranges_str: str, aspect: str, cam_side: str, outdir: str):
+    os.makedirs(outdir, exist_ok=True)
+    ranges = [r.strip() for r in ranges_str.split(",") if r.strip()]
+    for idx, rng in enumerate(ranges, start=1):
+        parts = [p.strip() for p in rng.split("-")]
+        if len(parts) != 2 or not parts[0] or not parts[1]:
+            continue
+        st, en = parts[0], parts[1]
+        fname = f"clip_{idx}_{safe_name(st)}_{safe_name(en)}_{safe_name(aspect)}.mp4"
+        out_path = os.path.join(outdir, fname)
+        cut_with_ffmpeg(input_file, st, en, aspect, cam_side, out_path)
+        print(f"SAVED: {out_path}")
+
+
 @app.get("/health")
 def health():
     return jsonify({"status": "ok", "outdir": OUT_DIR})
@@ -353,6 +368,21 @@ def trim_local():
         return send_file(out_path, mimetype="video/mp4", as_attachment=True, download_name="local_trimmed.mp4")
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--input")
+    parser.add_argument("--ranges")
+    parser.add_argument("--aspect", default="split")
+    parser.add_argument("--cam-side", default="bottom_right")
+    parser.add_argument("--outdir", default=OUT_DIR)
+    args, _ = parser.parse_known_args()
+    return args
+
+
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT") or 5000)
-    app.run(host="127.0.0.1", port=port)
+    cli_args = parse_args()
+    if cli_args.input and cli_args.ranges:
+        run_cli_batch(cli_args.input, cli_args.ranges, cli_args.aspect, cli_args.cam_side, cli_args.outdir)
+    else:
+        port = int(os.environ.get("PORT") or 5000)
+        app.run(host="127.0.0.1", port=port)
