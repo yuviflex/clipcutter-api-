@@ -5,8 +5,13 @@ import re
 import subprocess
 import tempfile
 import urllib.request
-from flask import Flask, jsonify, request, send_file
+from flask import Flask, Response, jsonify, request, send_file
 from flask_cors import CORS
+
+try:
+    import requests as http_requests
+except ImportError:
+    http_requests = None
 
 app = Flask(__name__)
 CORS(app)
@@ -15,6 +20,9 @@ BASE_DIR = os.path.expanduser("~/clipcutter")
 OUT_DIR = "/sdcard/Movies/ClipCutter"
 os.makedirs(BASE_DIR, exist_ok=True)
 os.makedirs(OUT_DIR, exist_ok=True)
+
+RENDER_API_URL = os.environ.get("RENDER_API_URL", "https://clipcutter-api-rm3t.onrender.com").rstrip("/")
+TERMUX_API_URL = os.environ.get("TERMUX_API_URL", "").rstrip("/")
 
 
 def fmt_sec(sec: int) -> str:
@@ -254,9 +262,71 @@ def run_cli_batch(input_file: str, ranges_str: str, aspect: str, cam_side: str, 
         print(f"SAVED: {out_path}")
 
 
+def forward_request(target_base: str, path: str, timeout: int = 120):
+    if http_requests is None:
+        raise RuntimeError("requests package is not installed")
+    url = f"{target_base}{path}"
+    headers = {k: v for k, v in request.headers.items() if k.lower() not in ("host", "content-length")}
+    resp = http_requests.request(
+        method=request.method,
+        url=url,
+        params=request.args,
+        data=request.files if request.files else request.get_data(),
+        headers=None if request.files else headers,
+        timeout=timeout,
+        stream=True,
+    )
+    excluded = {"content-encoding", "content-length", "transfer-encoding", "connection"}
+    out_headers = [(k, v) for k, v in resp.headers.items() if k.lower() not in excluded]
+    return Response(resp.iter_content(chunk_size=65536), status=resp.status_code, headers=out_headers)
+
+
 @app.get("/health")
 def health():
-    return jsonify({"status": "ok", "outdir": OUT_DIR})
+    return jsonify({
+        "status": "ok",
+        "outdir": OUT_DIR,
+        "render": RENDER_API_URL,
+        "termux": TERMUX_API_URL,
+    })
+
+
+@app.get("/gateway-status")
+def gateway_status():
+    return jsonify({
+        "status": "ok",
+        "render": RENDER_API_URL,
+        "termux": TERMUX_API_URL,
+    })
+
+
+@app.post("/set-termux")
+def set_termux():
+    global TERMUX_API_URL
+    data = request.get_json(silent=True) or {}
+    new_url = (data.get("url") or "").strip().rstrip("/")
+    if not new_url:
+        return jsonify({"error": "Missing url"}), 400
+    TERMUX_API_URL = new_url
+    return jsonify({"status": "updated", "termux": TERMUX_API_URL, "render": RENDER_API_URL})
+
+
+@app.route("/route/<path:subpath>", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
+def route_gateway(subpath: str):
+    path = f"/{subpath}"
+    is_analyze = "analyze" in path
+
+    order = [RENDER_API_URL, TERMUX_API_URL] if is_analyze else [TERMUX_API_URL, RENDER_API_URL]
+    order = [u for i, u in enumerate(order) if u and u not in order[:i]]
+
+    last_err = None
+    for base in order:
+        try:
+            return forward_request(base, path, timeout=35 if is_analyze else 120)
+        except Exception as e:
+            last_err = str(e)
+
+    return jsonify({"error": "All upstream APIs failed", "detail": last_err}), 502
 
 
 @app.post("/analyze-moments")
