@@ -1,4 +1,3 @@
-cat <<'EOF' > "$HOME/clipcutter/main.py"
 import argparse
 import json
 import os
@@ -98,7 +97,7 @@ def ask_gemini_moments(meta: dict, count: int, clip_len: int, exclude: list, see
         f"Duration (sec): {meta.get('duration', 600)}\n"
         f"Chapters: {json.dumps(meta.get('chapters', [])[:15])}\n"
         f"Description snippet: {meta.get('description', '')}\n"
-        f"Exclude ranges: {json.dumps(exclude[-40:])}\n"
+        f"Exclude ranges: {json.dumps(exclude[-50:])}\n"
         f"Seed: {seed}\n\n"
         f"Pick {count} completely new, distinct highlight segments of ~{clip_len} seconds each "
         f"within 0 to {meta.get('duration', 600)} seconds. Never reuse or overlap any excluded range.\n"
@@ -107,7 +106,7 @@ def ask_gemini_moments(meta: dict, count: int, clip_len: int, exclude: list, see
 
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 1.1},
+        "generationConfig": {"temperature": 1.15},
     }
 
     url = (
@@ -196,7 +195,6 @@ def build_distinct_moments(meta: dict, gemini_list: list, count: int, clip_len: 
         if not is_overlapping(st, en, chosen, excluded_spans):
             chosen.append({"start": fmt_sec(st), "end": fmt_sec(en)})
 
-    # Relax buffer if video is short and most ranges are excluded
     fallback_tries = 0
     while len(chosen) < count and fallback_tries < 100:
         fallback_tries += 1
@@ -486,5 +484,3 @@ if __name__ == "__main__":
     else:
         port = int(os.environ.get("PORT") or 5000)
         app.run(host="127.0.0.1", port=port)
-EOF
-python -m py_compile "$HOME/clipcutter/main.py"
