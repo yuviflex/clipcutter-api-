@@ -505,4 +505,80 @@ def download_with_ytdlp(url: str, output_file: str = "video.mp4", quality: str =
         url,
     ]
     subprocess.run(cmd, check=True)
+    import json
+import os
+import random
+import shutil
+import subprocess
+import threading
+import time
+import uuid
+from pathlib import Path
+from flask import Flask, jsonify, request, send_file
+from flask_cors import CORS
+
+app = Flask(__name__)
+CORS(app)
+
+BASE_DIR = Path.home() / "clipcutter"
+LOG_FILE = BASE_DIR / "api.log"
+JOBS_DIR = BASE_DIR / "jobs"
+GALLERY_DIR = Path("/sdcard/Movies/ClipCutter")
+
+BASE_DIR.mkdir(parents=True, exist_ok=True)
+JOBS_DIR.mkdir(parents=True, exist_ok=True)
+try:
+    GALLERY_DIR.mkdir(parents=True, exist_ok=True)
+except Exception:
+    pass
+
+JOBS = {}
+JOBS_LOCK = threading.Lock()
+
+
+def log_msg(msg: str):
+    line = f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}"
+    print(line, flush=True)
+    try:
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
+
+
+def fmt_hms(sec: int) -> str:
+    sec = max(0, int(sec))
+    h = sec // 3600
+    m = (sec % 3600) // 60
+    s = sec % 60
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+
+def set_job(job_id: str, **updates):
+    with JOBS_LOCK:
+        cur = JOBS.get(job_id, {"job_id": job_id, "status": "running", "progress": 5, "stage": "starting"})
+        cur.update(updates)
+        JOBS[job_id] = cur
+        return dict(cur)
+
+
+def get_job(job_id: str):
+    with JOBS_LOCK:
+        return dict(JOBS.get(job_id, {}))
+
+
+def run_cut_worker(job_id: str, payload: dict):
+    out_dir = Path(payload.get("gallery_dir") or str(GALLERY_DIR))
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        out_dir = JOBS_DIR
+
+    action = (payload.get("action") or "auto_clip_download").strip()
+    idx = int(payload.get("index") or 1)
+    url = (payload.get("url") or "").strip()
+    local_file = (payload.get("file") or "").strip()
+    start = (payload.get("start") or "00:00:00").strip()
+    end = (payload.get("end") or "00:00:25").strip
+
 
