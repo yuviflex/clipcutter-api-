@@ -1,7 +1,10 @@
+import json
 import os
 import random
+import re
 import shutil
 import subprocess
+import tempfile
 import threading
 import time
 import uuid
@@ -30,6 +33,11 @@ JOBS = {}
 JOBS_LOCK = threading.Lock()
 RECENT_STARTS = []
 RECENT_LOCK = threading.Lock()
+
+HYPE_PATTERN = re.compile(
+    r"\b(clip|crazy|insane|wild|omg|wtf|lmao|lol|bruh|goat|clutch|no way|what|sheesh|sheru|fire|peak)\b|[🔥😂💀😭😱🤯 Chad|W|L]+",
+    re.I,
+)
 
 
 def log_msg(msg: str):
@@ -80,6 +88,262 @@ def set_job(job_id: str, **updates):
 def get_job(job_id: str):
     with JOBS_LOCK:
         return dict(JOBS.get(job_id, {}))
+
+
+def _extract_chat_events(chat_path: Path, video_start_ms: int | None):
+    """Parse yt-dlp live_chat json/json3 lines into (sec, hype_weight, sample_text)."""
+    events = []
+    try:
+        raw_text = chat_path.read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        return events
+
+    for line in raw_text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except Exception:
+            continue
+
+        sec = None
+        text_parts = []
+
+        # YouTube live chat replay structure inside yt-dlp dump
+        replay = obj.get("replayChatItemAction") or {}
+        actions = replay.get("actions") or []
+        offset_ms = replay.get("videoOffsetTimeMsec")
+        if offset_ms is not None:
+            try:
+                sec = max(0, int(int(offset_ms) / 1000))
+            except Exception:
+                sec = None
+
+        for act in actions:
+            item = (act.get("addChatItemAction") or {}).get("item") or {}
+            renderer = (
+                item.get("liveChatTextMessageRenderer")
+                or item.get("liveChatPaidMessageRenderer")
+                or {}
+            )
+            if sec is None:
+                ts_usec = renderer.get("timestampUsec")
+                if ts_usec and video_start_ms:
+                    try:
+                        sec = max(0, int((int(ts_usec) // 1000 - video_start_ms) / 1000))
+                    except Exception:
+                        sec = None
+
+            runs = (renderer.get("message") or {}).get("runs") or []
+            for r in runs:
+                if isinstance(r, dict):
+                    if r.get("text"):
+                        text_parts.append(str(r["text"]))
+                    emoji_sc = ((r.get("emoji") or {}).get("shortcuts")) or []
+                    if emoji_sc:
+                        text_parts.append(" ".join(str(x) for x in emoji_sc))
+
+        if sec is not None:
+            msg = " ".join(text_parts).strip()
+            weight = 1.0
+            if msg and HYPE_PATTERN.search(msg):
+                weight += 1.6
+            if len(msg) >= 1 and sum(1 for ch in msg if ord(ch) > 127) >= 2:
+                weight += 0.8
+            events.append((sec, weight, msg[:45]))
+
+    return events
+
+
+def fetch_live_chat_candidates(yt_url: str, max_start: int):
+    """Fetch YouTube live chat replay spikes using yt-dlp into a temporary folder."""
+    candidates = []
+    if not yt_url or not shutil.which("yt-dlp"):
+        return candidates
+
+    with tempfile.TemporaryDirectory(prefix="cc_chat_") as tmpdir:
+        out_tpl = str(Path(tmpdir) / "chat")
+        cmd = [
+            "yt-dlp",
+            "--skip-download",
+            "--write-subs",
+            "--sub-langs", "live_chat",
+            "--sub-format", "json3/json",
+            "--no-warnings",
+            "--no-playlist",
+            "-o", out_tpl,
+            yt_url,
+        ]
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=18)
+            chat_files = list(Path(tmpdir).glob("chat*"))
+            if proc.returncode != 0 and not chat_files:
+                return candidates
+
+            all_events = []
+            for cf in chat_files:
+                all_events.extend(_extract_chat_events(cf, None))
+
+            if not all_events:
+                return candidates
+
+            # Bucket chat hype into 10-second windows
+            buckets = {}
+            for sec, weight, sample in all_events:
+                b = (sec // 10) * 10
+                cur = buckets.get(b, {"score": 0.0, "count": 0, "sample": ""})
+                cur["score"] += weight
+                cur["count"] += 1
+                if not cur["sample"] and sample:
+                    cur["sample"] = sample
+                buckets[b] = cur
+
+            # Smooth across neighboring windows (prev + current + next)
+            smoothed = []
+            for b, info in buckets.items():
+                neighbor_bonus = (
+                    buckets.get(b - 10, {}).get("score", 0.0) * 0.5
+                    + buckets.get(b + 10, {}).get("score", 0.0) * 0.5
+                )
+                total_hype = info["score"] + neighbor_bonus
+                # Slightly lead before peak (-4s) so reaction/build-up isn't cut off
+                start_sec = max(5, min(max_start, b - 4))
+                reason = f"Chat spike ({info['count']} msgs)"
+                if info["sample"]:
+                    reason = f"{reason}: {info['sample']}"
+                smoothed.append((total_hype, start_sec, reason))
+
+            smoothed.sort(key=lambda x: x[0], reverse=True)
+            top_hype = smoothed[0][0] if smoothed else 1.0
+
+            for total_hype, s_sec, reason in smoothed[:25]:
+                norm_score = int(75 + min(25, (total_hype / max(1.0, top_hype)) * 25))
+                candidates.append({
+                    "sec": s_sec,
+                    "score": norm_score,
+                    "reason": reason,
+                })
+        except Exception:
+            return candidates
+
+    return candidates
+
+
+def fetch_video_moment_candidates(yt_url: str):
+    """Extract chapters, heatmap peaks, description timestamps, and livestream chat spikes."""
+    candidates = []
+    max_start = 1800
+    if not yt_url or not shutil.which("yt-dlp"):
+        return max_start, candidates
+
+    try:
+        cmd = [
+            "yt-dlp",
+            "--dump-single-json",
+            "--skip-download",
+            "--no-warnings",
+            "--no-playlist",
+            yt_url,
+        ]
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=14)
+        if proc.returncode == 0 and proc.stdout:
+            info = json.loads(proc.stdout)
+            duration = int(info.get("duration") or 1800)
+            max_start = max(60, duration - 30)
+
+            for ch in info.get("chapters") or []:
+                st = ch.get("start_time")
+                title = str(ch.get("title") or "").strip()
+                if isinstance(st, (int, float)) and 10 <= int(st) <= max_start:
+                    score = 80
+                    if re.search(r"(twist|climax|reveal|ending|best|funny|crazy|shock|fail|win|moment|highlight)", title, re.I):
+                        score += 20
+                    candidates.append({"sec": int(st), "score": score, "reason": title or "Chapter highlight"})
+
+            for hm in info.get("heatmap") or []:
+                st = hm.get("start_time")
+                val = hm.get("value")
+                if isinstance(st, (int, float)) and 10 <= int(st) <= max_start:
+                    score = int(70 + min(30, float(val or 0) * 30))
+                    candidates.append({"sec": int(st), "score": score, "reason": "High replay peak"})
+
+            desc = str(info.get("description") or "")
+            for m in re.finditer(r"(?<!\d)(\d{1,2}:\d{2}(?::\d{2})?)\s*[-–—:|]?\s*([^\n]{0,50})", desc):
+                sec = parse_sec(m.group(1))
+                label = (m.group(2) or "").strip()
+                if sec is not None and 10 <= sec <= max_start:
+                    score = 75
+                    if re.search(r"(twist|climax|reveal|best|funny|crazy|shock|moment)", label, re.I):
+                        score += 15
+                    candidates.append({"sec": sec, "score": score, "reason": label or "Description highlight"})
+    except Exception:
+        pass
+
+    # Livestream chat spikes
+    candidates.extend(fetch_live_chat_candidates(yt_url, max_start))
+    return max_start, candidates
+
+
+def pick_best_moments(yt_url: str, count: int, dur: int, max_start_arg: int, avoid_list: list[int]):
+    max_start, candidates = fetch_video_moment_candidates(yt_url)
+    if max_start_arg:
+        max_start = max(60, min(max_start, max_start_arg))
+
+    picked = []
+    clips = []
+
+    ranked = sorted(
+        candidates,
+        key=lambda c: c["score"] + _sys_rng.randint(-12, 12),
+        reverse=True,
+    )
+
+    for cand in ranked:
+        if len(clips) >= count:
+            break
+        s = max(10, min(max_start, int(cand["sec"])))
+        if any(abs(s - u) < dur + 20 for u in picked):
+            continue
+        if any(abs(s - a) < max(15, dur // 2) for a in avoid_list):
+            continue
+        picked.append(s)
+        clips.append({
+            "index": len(clips) + 1,
+            "start": fmt_hms(s),
+            "end": fmt_hms(s + dur),
+            "duration": dur,
+            "reason": cand["reason"],
+        })
+
+    zones = [
+        (max(15, int(max_start * 0.10)), max(30, int(max_start * 0.35)), "Early hook moment"),
+        (max(30, int(max_start * 0.35)), max(60, int(max_start * 0.72)), "Mid-video peak moment"),
+        (max(45, int(max_start * 0.72)), max(60, max_start), "Climax / late highlight"),
+    ]
+
+    while len(clips) < count:
+        z_low, z_high, z_reason = _sys_rng.choice(zones)
+        if z_high <= z_low:
+            z_low, z_high = 15, max(60, max_start)
+        s = _sys_rng.randint(z_low, z_high)
+        tries = 0
+        while (
+            any(abs(s - u) < dur + 20 for u in picked)
+            or any(abs(s - a) < max(15, dur // 2) for a in avoid_list)
+        ) and tries < 80:
+            s = _sys_rng.randint(15, max(60, max_start))
+            tries += 1
+        picked.append(s)
+        clips.append({
+            "index": len(clips) + 1,
+            "start": fmt_hms(s),
+            "end": fmt_hms(s + dur),
+            "duration": dur,
+            "reason": z_reason,
+        })
+
+    return picked, clips
 
 
 def run_cut_worker(job_id: str, payload: dict):
@@ -207,9 +471,10 @@ def health():
 @app.post("/generate")
 def moments():
     data = request.get_json(silent=True) or {}
+    yt_url = (data.get("url") or data.get("video_url") or "").strip()
     count = max(1, min(10, int(data.get("count") or data.get("num_clips") or 3)))
     dur = max(10, min(180, int(data.get("duration") or data.get("clip_duration") or 25)))
-    max_start = max(120, min(7200, int(data.get("max_start") or 1800)))
+    max_start_arg = int(data.get("max_start") or 0)
 
     extra_avoid = []
     for item in (data.get("previous_clips") or data.get("exclude") or []):
@@ -218,34 +483,14 @@ def moments():
             extra_avoid.append(s)
 
     with RECENT_LOCK:
-        avoid = list(RECENT_STARTS[-40:]) + extra_avoid
+        avoid = list(RECENT_STARTS[-50:]) + extra_avoid
 
-    clips = []
-    picked = []
-
-    for i in range(count):
-        start_sec = _sys_rng.randint(15, max_start)
-        tries = 0
-        while (
-            any(abs(start_sec - u) < dur + 20 for u in picked)
-            or any(abs(start_sec - a) < max(15, dur // 2) for a in avoid)
-        ) and tries < 80:
-            start_sec = _sys_rng.randint(15, max_start)
-            tries += 1
-
-        picked.append(start_sec)
-        end_sec = start_sec + dur
-        clips.append({
-            "index": i + 1,
-            "start": fmt_hms(start_sec),
-            "end": fmt_hms(end_sec),
-            "duration": dur,
-        })
+    picked, clips = pick_best_moments(yt_url, count, dur, max_start_arg, avoid)
 
     with RECENT_LOCK:
         RECENT_STARTS.extend(picked)
-        if len(RECENT_STARTS) > 100:
-            del RECENT_STARTS[:-100]
+        if len(RECENT_STARTS) > 120:
+            del RECENT_STARTS[:-120]
 
     nonce = f"{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}"
     resp = make_response(jsonify({
