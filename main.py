@@ -6,11 +6,13 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from flask import Flask, jsonify, request, send_file
+from flask import Flask, jsonify, make_response, request, send_file
 from flask_cors import CORS
 
 app = Flask(__name__)
 CORS(app)
+
+_sys_rng = random.SystemRandom()
 
 BASE_DIR = Path.home() / "clipcutter"
 LOG_FILE = BASE_DIR / "api.log"
@@ -26,6 +28,8 @@ except Exception:
 
 JOBS = {}
 JOBS_LOCK = threading.Lock()
+RECENT_STARTS = []
+RECENT_LOCK = threading.Lock()
 
 
 def log_msg(msg: str):
@@ -44,6 +48,25 @@ def fmt_hms(sec: int) -> str:
     m = (sec % 3600) // 60
     s = sec % 60
     return f"{h:02d}:{m:02d}:{s:02d}"
+
+
+def parse_sec(val):
+    if val is None:
+        return None
+    if isinstance(val, (int, float)):
+        return max(0, int(val))
+    parts = str(val).strip().split(":")
+    try:
+        nums = [int(float(p)) for p in parts]
+    except ValueError:
+        return None
+    if len(nums) == 3:
+        return nums[0] * 3600 + nums[1] * 60 + nums[2]
+    if len(nums) == 2:
+        return nums[0] * 60 + nums[1]
+    if len(nums) == 1:
+        return max(0, nums[0])
+    return None
 
 
 def set_job(job_id: str, **updates):
@@ -172,7 +195,9 @@ def run_cut_worker(job_id: str, payload: dict):
 @app.get("/")
 @app.get("/health")
 def health():
-    return jsonify({"status": "ok", "service": "clipcutter-main"})
+    resp = make_response(jsonify({"status": "ok", "service": "clipcutter-main", "ts": int(time.time() * 1000)}))
+    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    return resp
 
 
 @app.post("/moments")
@@ -184,18 +209,31 @@ def moments():
     data = request.get_json(silent=True) or {}
     count = max(1, min(10, int(data.get("count") or data.get("num_clips") or 3)))
     dur = max(10, min(180, int(data.get("duration") or data.get("clip_duration") or 25)))
+    max_start = max(120, min(7200, int(data.get("max_start") or 1800)))
 
-    rng = random.Random()
-    used = []
+    extra_avoid = []
+    for item in (data.get("previous_clips") or data.get("exclude") or []):
+        s = parse_sec(item.get("start") if isinstance(item, dict) else item)
+        if s is not None:
+            extra_avoid.append(s)
+
+    with RECENT_LOCK:
+        avoid = list(RECENT_STARTS[-40:]) + extra_avoid
+
     clips = []
+    picked = []
 
     for i in range(count):
-        start_sec = rng.randint(30, 720)
+        start_sec = _sys_rng.randint(15, max_start)
         tries = 0
-        while any(abs(start_sec - u) < dur + 20 for u in used) and tries < 30:
-            start_sec = rng.randint(30, 900)
+        while (
+            any(abs(start_sec - u) < dur + 20 for u in picked)
+            or any(abs(start_sec - a) < max(15, dur // 2) for a in avoid)
+        ) and tries < 80:
+            start_sec = _sys_rng.randint(15, max_start)
             tries += 1
-        used.append(start_sec)
+
+        picked.append(start_sec)
         end_sec = start_sec + dur
         clips.append({
             "index": i + 1,
@@ -204,7 +242,20 @@ def moments():
             "duration": dur,
         })
 
-    return jsonify({"ok": True, "clips": clips})
+    with RECENT_LOCK:
+        RECENT_STARTS.extend(picked)
+        if len(RECENT_STARTS) > 100:
+            del RECENT_STARTS[:-100]
+
+    nonce = f"{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}"
+    resp = make_response(jsonify({
+        "ok": True,
+        "nonce": nonce,
+        "clips": clips,
+    }))
+    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    resp.headers["Pragma"] = "no-cache"
+    return resp
 
 
 @app.post("/exec")
