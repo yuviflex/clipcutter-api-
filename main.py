@@ -481,6 +481,28 @@ if __name__ == "__main__":
     cli_args = parse_args()
     if cli_args.input and cli_args.ranges:
         run_cli_batch(cli_args.input, cli_args.ranges, cli_args.aspect, cli_args.cam_side, cli_args.outdir)
+        
     else:
         port = int(os.environ.get("PORT") or 5000)
         app.run(host="127.0.0.1", port=port)
+        import subprocess
+
+
+def download_with_ytdlp(url: str, output_file: str = "video.mp4", quality: str = "720p") -> None:
+    fmt = (
+        "bv*+ba/b"
+        if quality == "best"
+        else "bv*[height<=720]+ba/b[height<=720]/b"
+    )
+    cmd = [
+        "yt-dlp",
+        "-f",
+        fmt,
+        "--merge-output-format",
+        "mp4",
+        "-o",
+        output_file,
+        url,
+    ]
+    subprocess.run(cmd, check=True)
+
